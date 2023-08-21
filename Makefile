@@ -14,7 +14,7 @@ rundebug: run.c
 
 .PHONY: runneon
 runneon: run.c
-	$(CC) -Ofast -mfpu=neon -ftree-vectorize -funsafe-math-optimizations -march=native run.c  -lm  -o run
+	$(CC) -Ofast -march=native -ftree-vectorize -funsafe-math-optimizations run.c  -lm  -o run
 
 # https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
 # https://simonbyrne.github.io/notes/fastmath/
