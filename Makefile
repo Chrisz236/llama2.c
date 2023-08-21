@@ -16,6 +16,10 @@ rundebug: run.c
 runneon: run.c
 	$(CC) -Ofast -march=native -fopenmp -ftree-vectorize -funsafe-math-optimizations run.c  -lm  -o run
 
+.PHONY: runoblas
+runneon: run.c
+	$(CC) -Ofast -march=native -fopenmp -lopenblas -ftree-vectorize -funsafe-math-optimizations run.c  -lm  -o run
+
 # https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
 # https://simonbyrne.github.io/notes/fastmath/
 # -Ofast enables all -O3 optimizations.
