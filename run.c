@@ -9,6 +9,7 @@
 #include <fcntl.h>
 
 #include <arm_neon.h>
+#include <cblas.h> 
 
 #if defined _WIN32
     #include "win.h"
@@ -222,26 +223,7 @@ void softmax(float* x, int size) {
 
 // simple try on optimize with ARM NEON
 void matmul(float* xout, float* x, float* w, int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    
-    #pragma omp parallel for
-    for (int i = 0; i < d; i++) {
-        float32x4_t accum = vdupq_n_f32(0.0f);
-
-        for (int j = 0; j < n; j += 4) {
-            float32x4_t w_vec = vld1q_f32(&w[i * n + j]);
-            float32x4_t x_vec = vld1q_f32(&x[j]);
-
-            accum = vmlaq_f32(accum, w_vec, x_vec);
-        }
-
-        // Horizontal add across the accumulator lanes
-        float32x2_t sum = vpadd_f32(vget_low_f32(accum), vget_high_f32(accum));
-        float32x2_t sum_result = vpadd_f32(sum, sum);
-
-        // Store the sum in the output vector
-        xout[i] = vget_lane_f32(sum_result, 0);
-    }
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, d, n, 1.0f, w, n, x, 1, 0.0f, xout, 1);
 }
 
 float* forward(Transformer* transformer, int token, int pos) {
