@@ -12,6 +12,10 @@ run: run.c
 rundebug: run.c
 	$(CC) -g -o run run.c -lm
 
+.PHONY: runneon
+runneon: run.c
+	$(CC) -Ofast -mfpu=neon -ftree-vectorize -funsafe-math-optimizations -march=native run.c  -lm  -o run
+
 # https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
 # https://simonbyrne.github.io/notes/fastmath/
 # -Ofast enables all -O3 optimizations.
