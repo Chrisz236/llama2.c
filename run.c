@@ -343,14 +343,14 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
         matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
 
-        // F.silu; silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
+        // SwiGLU non-linearity
         for (int i = 0; i < hidden_dim; i++) {
-            s->hb[i] = s->hb[i] * (1.0f / (1.0f + expf(-s->hb[i])));
-        }
-
-        // elementwise multiply with w3(x)
-        for (int i = 0; i < hidden_dim; i++) {
-            s->hb[i] = s->hb[i] * s->hb2[i];
+            float val = s->hb[i];
+            // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+            val *= (1.0f / (1.0f + expf(-val)));
+            // elementwise multiply with w3(x)
+            val *= s->hb2[i];
+            s->hb[i] = val;
         }
 
         // final matmul to get the output of the ffn
@@ -374,12 +374,22 @@ float* forward(Transformer* transformer, int token, int pos) {
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
 
 typedef struct {
+    char *str;
+    int id;
+} TokenIndex;
+
+typedef struct {
     char** vocab;
     float* vocab_scores;
+    TokenIndex *sorted_vocab;
     int vocab_size;
     unsigned int max_token_length;
     char byte_piece[2];
 } Tokenizer;
+
+int compare_tokens(const void *a, const void *b) {
+    return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
+}
 
 void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
     // i should have written the vocab_size into the tokenizer file... sigh
@@ -388,6 +398,7 @@ void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
     t->vocab = (char**)malloc(vocab_size * sizeof(char*));
     t->vocab_scores = (float*)malloc(vocab_size * sizeof(float));
     t->byte_piece[1] = '\0'; // null terminate the byte_piece string
+    t->sorted_vocab = NULL; // initialized lazily
     // read in the file
     FILE *file = fopen(tokenizer_path, "rb");
     if (!file) { fprintf(stderr, "couldn't load %s\n", tokenizer_path); exit(EXIT_FAILURE); }
@@ -407,6 +418,7 @@ void free_tokenizer(Tokenizer* t) {
     for (int i = 0; i < t->vocab_size; i++) { free(t->vocab[i]); }
     free(t->vocab);
     free(t->vocab_scores);
+    free(t->sorted_vocab);
 }
 
 char* decode(Tokenizer* t, int prev_token, int token) {
@@ -426,15 +438,6 @@ char* decode(Tokenizer* t, int prev_token, int token) {
     return piece;
 }
 
-typedef struct {
-    char *str;
-    int id;
-} TokenIndex;
-
-int compare_tokens(const void *a, const void *b) {
-    return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
-}
-
 int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     // efficiently find the perfect match for str in vocab, return its index or -1 if not found
     TokenIndex tok = { .str = str }; // acts as the key to search for
@@ -445,20 +448,23 @@ int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
 void encode(Tokenizer* t, char *text, int *tokens, int *n_tokens) {
     // encode the string text (input) into an upper-bound preallocated tokens[] array
 
-    // sort vocabulary
-    TokenIndex *sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
-    for (int i = 0; i < t->vocab_size; i++) {
-        sorted_vocab[i].str = t->vocab[i];
-        sorted_vocab[i].id = i;
+    if (t->sorted_vocab == NULL) {
+        // lazily malloc and sort the vocabulary
+        t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
+        for (int i = 0; i < t->vocab_size; i++) {
+            t->sorted_vocab[i].str = t->vocab[i];
+            t->sorted_vocab[i].id = i;
+        }
+        qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
     }
-    qsort(sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
 
     // create a temporary buffer that will store merge candidates of always two consecutive tokens
-    char* str_buffer = malloc((t->max_token_length*2 +1 +2) * sizeof(char)); // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_lenght is 1)
+    // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_lenght is 1)
+    char* str_buffer = malloc((t->max_token_length*2 +1 +2) * sizeof(char));
     size_t str_len = 0;
 
     // add_dummy_prefix is true by default
-    tokens[0] = str_lookup(" ", sorted_vocab, t->vocab_size);
+    tokens[0] = str_lookup(" ", t->sorted_vocab, t->vocab_size);
     *n_tokens = 1; // the number of tokens
 
     // Okay UTF-8 time. This will get messy. Here is the reference from Wikipedia:
@@ -494,7 +500,7 @@ void encode(Tokenizer* t, char *text, int *tokens, int *n_tokens) {
         }
 
         // ok c+1 is not a continuation byte, so we've read in a full codepoint
-        int id = str_lookup(str_buffer, sorted_vocab, t->vocab_size);
+        int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
 
         if (id != -1) {
             // we found this codepoint in vocab, add it as a token
@@ -519,7 +525,7 @@ void encode(Tokenizer* t, char *text, int *tokens, int *n_tokens) {
         for (int i=0; i < (*n_tokens-1); i++) {
             // check if we can merge the pair (tokens[i], tokens[i+1])
             sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i+1]]);
-            int id = str_lookup(str_buffer, sorted_vocab, t->vocab_size);
+            int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
             if (id != -1 && t->vocab_scores[id] > best_score) {
                 // this merge pair exists in vocab! record its score and position
                 best_score = t->vocab_scores[id];
@@ -542,7 +548,6 @@ void encode(Tokenizer* t, char *text, int *tokens, int *n_tokens) {
     }
 
     free(str_buffer);
-    free(sorted_vocab);
 }
 
 // ----------------------------------------------------------------------------
@@ -557,21 +562,10 @@ typedef struct {
 typedef struct {
     int vocab_size;
     ProbIndex* probindex; // buffer used in top-p sampling
+    float temperature;
+    float topp;
+    unsigned long long rng_state;
 } Sampler;
-
-// rng should technically be a state variable of the Sampler
-// leaving it global here for now for convenience, maybe move later
-unsigned long long rng_seed;
-unsigned int random_u32() {
-    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-    rng_seed ^= rng_seed >> 12;
-    rng_seed ^= rng_seed << 25;
-    rng_seed ^= rng_seed >> 27;
-    return (rng_seed * 0x2545F4914F6CDD1Dull) >> 32;
-}
-float random_f32() { // random float32 in [0,1)
-    return (random_u32() >> 8) / 16777216.0f;
-}
 
 int sample_argmax(float* probabilities, int n) {
     // return the index that has the highest probability
@@ -586,13 +580,13 @@ int sample_argmax(float* probabilities, int n) {
     return max_i;
 }
 
-int sample_mult(float* probabilities, int n) {
+int sample_mult(float* probabilities, int n, float coin) {
     // sample index from probabilities (they must sum to 1!)
-    float r = random_f32();
+    // coin is a random number in [0, 1), usually from random_f32()
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
         cdf += probabilities[i];
-        if (r < cdf) {
+        if (coin < cdf) {
             return i;
         }
     }
@@ -607,10 +601,11 @@ int compare(const void* a, const void* b) {
     return 0;
 }
 
-int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex) {
+int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, float coin) {
     // top-p sampling (or "nucleus sampling") samples from the smallest set of
     // tokens that exceed probability topp. This way we never sample tokens that
     // have very low probabilities and are less likely to go "off the rails".
+    // coin is a random number in [0, 1), usually from random_f32()
 
     int n0 = 0;
     // quicksort indices in descending order of probabilities
@@ -638,7 +633,7 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex) {
     }
 
     // sample from the truncated list
-    float r = random_f32() * cumulative_prob;
+    float r = coin * cumulative_prob;
     float cdf = 0.0f;
     for (int i = 0; i <= last_idx; i++) {
         cdf += probindex[i].prob;
@@ -649,34 +644,50 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex) {
     return probindex[last_idx].index; // in case of rounding errors
 }
 
-void build_sampler(Sampler* sampler, int vocab_size) {
+void build_sampler(Sampler* sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
     sampler->vocab_size = vocab_size;
-    // probindex might not be needed, but it's a ~small buffer so we'll just malloc it
-    sampler->probindex = malloc(vocab_size * sizeof(ProbIndex));
+    sampler->temperature = temperature;
+    sampler->topp = topp;
+    sampler->rng_state = rng_seed;
+    // buffer only used with nucleus sampling; may not need but it's ~small
+    sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
 }
 
 void free_sampler(Sampler* sampler) {
     free(sampler->probindex);
 }
 
-int sample(Sampler* sampler, float* logits, float temperature, float topp) {
+unsigned int random_u32(unsigned long long *state) {
+    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
+}
+float random_f32(unsigned long long *state) { // random float32 in [0,1)
+    return (random_u32(state) >> 8) / 16777216.0f;
+}
+
+int sample(Sampler* sampler, float* logits) {
     // sample the token given the logits and some hyperparameters
     int next;
-    if (temperature == 0.0f) {
+    if (sampler->temperature == 0.0f) {
         // greedy argmax sampling: take the token with the highest probability
         next = sample_argmax(logits, sampler->vocab_size);
     } else {
         // apply the temperature to the logits
-        for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= temperature; }
+        for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
         // apply softmax to the logits to get the probabilities for next token
         softmax(logits, sampler->vocab_size);
+        // flip a (float) coin (this is our source of entropy for sampling)
+        float coin = random_f32(&sampler->rng_state);
         // we sample from this distribution to get the next token
-        if (topp <= 0 || topp >= 1) {
+        if (sampler->topp <= 0 || sampler->topp >= 1) {
             // simply sample from the predicted probability distribution
-            next = sample_mult(logits, sampler->vocab_size);
+            next = sample_mult(logits, sampler->vocab_size, coin);
         } else {
             // top-p (nucleus) sampling, clamping the least likely tokens to zero
-            next = sample_topp(logits, sampler->vocab_size, topp, sampler->probindex);
+            next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
         }
     }
     return next;
@@ -690,6 +701,62 @@ long time_in_ms() {
     struct timespec time;
     clock_gettime(CLOCK_REALTIME, &time);
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
+}
+
+// ----------------------------------------------------------------------------
+// generation loop
+
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
+
+    // encode the (string) prompt into tokens sequence, if any is given
+    int *prompt_tokens = NULL; // the sequence of prompt tokens
+    int num_prompt_tokens = 0; // the total number of prompt tokens
+    if (prompt != NULL) {
+        prompt_tokens = (int*)malloc((strlen(prompt)+1) * sizeof(int));
+        encode(tokenizer, prompt, prompt_tokens, &num_prompt_tokens);
+    }
+
+    // start the main loop
+    long start = 0;  // used to time our code, only initialized after first iteration
+    int next;        // will store the next token in the sequence
+    int token = 1;   // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
+    int pos = 0;     // position in the sequence
+    while (pos < steps) {
+
+        // forward the transformer to get logits for the next token
+        float* logits = forward(transformer, token, pos);
+
+        // advance the state state machine
+        if (pos < num_prompt_tokens) {
+            // if we are still processing the input prompt, force the next prompt token
+            next = prompt_tokens[pos];
+        } else {
+            // otherwise sample the next token from the logits
+            next = sample(sampler, logits);
+        }
+        pos++;
+
+        // data-dependent terminating condition: the BOS (1) token delimits sequences
+        if (next == 1) { break; }
+
+        // print the token as string, decode it with the Tokenizer object
+        char* piece = decode(tokenizer, token, next);
+        printf("%s", piece);
+        fflush(stdout);
+        token = next;
+
+        // init the timer here because the first iteration can be slower
+        if (start == 0) { start = time_in_ms(); }
+    }
+    printf("\n");
+
+    // report achieved tok/s (pos-1 because the timer starts after first iteration)
+    if (pos > 1) {
+        long end = time_in_ms();
+        fprintf(stderr, "achieved tok/s: %f\n", (pos-1) / (double)(end-start)*1000);
+    }
+
+    free(prompt_tokens);
 }
 
 // ----------------------------------------------------------------------------
@@ -715,9 +782,9 @@ int main(int argc, char *argv[]) {
     char *tokenizer_path = "tokenizer.bin";
     float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
-    rng_seed = 0; // seed rng with time by default
     int steps = 256;          // number of steps to run for
     char *prompt = NULL;      // prompt string
+    unsigned long long rng_seed = 0; // seed rng with time by default
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
@@ -740,11 +807,12 @@ int main(int argc, char *argv[]) {
     if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
     if (temperature < 0.0) temperature = 0.0;
     if (topp < 0.0 || 1.0 < topp) topp = 0.9;
-    if (steps <= 0) steps = 0;
+    if (steps < 0) steps = 0;
 
     // build the Transformer via the model .bin file
     Transformer transformer;
     build_transformer(&transformer, checkpoint_path);
+    if (steps == 0) steps = transformer.config.seq_len; // ovrerride to ~max length
 
     // build the Tokenizer via the tokenizer .bin file
     Tokenizer tokenizer;
@@ -752,58 +820,12 @@ int main(int argc, char *argv[]) {
 
     // build the Sampler
     Sampler sampler;
-    build_sampler(&sampler, transformer.config.vocab_size);
+    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
 
-    // encode the (string) prompt into tokens sequence, if any is given
-    int *prompt_tokens = NULL; // the sequence of prompt tokens
-    int num_prompt_tokens = 0; // the total number of prompt tokens
-    if (prompt != NULL) {
-        prompt_tokens = (int*)malloc((strlen(prompt)+1) * sizeof(int));
-        encode(&tokenizer, prompt, prompt_tokens, &num_prompt_tokens);
-    }
-
-    // start the main loop
-    long start = 0;  // used to time our code, only initialized after first iteration
-    int next;        // will store the next token in the sequence
-    int token = 1;   // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
-    int pos = 0;     // position in the sequence
-    while (pos < steps) {
-
-        // forward the transformer to get logits for the next token
-        float* logits = forward(&transformer, token, pos);
-
-        // advance the state state machine
-        if (pos < num_prompt_tokens) {
-            // if we are still processing the input prompt, force the next prompt token
-            next = prompt_tokens[pos];
-        } else {
-            // otherwise sample the next token from the logits
-            next = sample(&sampler, logits, temperature, topp);
-        }
-        pos++;
-
-        // data-dependent terminating condition: the BOS (1) token delimits sequences
-        if (next == 1) { break; }
-
-        // print the token as string, decode it with the Tokenizer object
-        char* piece = decode(&tokenizer, token, next);
-        printf("%s", piece);
-        fflush(stdout);
-        token = next;
-
-        // init the timer here because the first iteration can be slower
-        if (start == 0) { start = time_in_ms(); }
-    }
-    printf("\n");
-
-    // report achieved tok/s (pos-1 because the timer starts after first iteration)
-    if (pos > 1) {
-        long end = time_in_ms();
-        fprintf(stderr, "achieved tok/s: %f\n", (pos-1) / (double)(end-start)*1000);
-    }
+    // run!
+    generate(&transformer, &tokenizer, &sampler, prompt, steps);
 
     // memory and file handles cleanup
-    if (prompt_tokens != NULL) { free(prompt_tokens); }
     free_sampler(&sampler);
     free_tokenizer(&tokenizer);
     free_transformer(&transformer);
