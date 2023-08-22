@@ -9,8 +9,6 @@
 #include <fcntl.h>
 
 #include <arm_neon.h>
-#include <CL/cl.h>
-#include <clblast_c.h> 
 
 #if defined _WIN32
     #include "win.h"
@@ -224,28 +222,17 @@ void softmax(float* x, int size) {
 
 // simple try on optimize with ARM NEON
 void matmul(float* xout, float* x, float* w, int n, int d) {
-    // Create CLBlast buffers for input and output data
-    CLBlastStatusCode status;
-    CLBlastBuffer x_buf, w_buf, xout_buf;
-
-    status = CLBlastBufferCreate(sizeof(float) * n, queue, &x_buf);
-    status = CLBlastBufferCreate(sizeof(float) * d * n, queue, &w_buf);
-    status = CLBlastBufferCreate(sizeof(float) * d, queue, &xout_buf);
-
-    // Copy input data to CLBlast buffers
-    status = CLBlastSetVector(n, sizeof(float), x, 0, x_buf);
-    status = CLBlastSetVector(d * n, sizeof(float), w, 0, w_buf);
-
-    // Call CLBlast's SGEMV function to perform the matrix-vector multiplication
-    status = CLBlastSgemv(CLBlastLayoutRowMajor, CLBlastTransposeNo, d, n, 1.0f, w_buf, 0, n, x_buf, 0, 1, 0.0f, xout_buf, 0, 1, queue);
-
-    // Read the results back to CPU
-    status = CLBlastGetVector(d, sizeof(float), xout_buf, 0, xout);
-
-    // Cleanup: Release CLBlast buffers
-    status = CLBlastBufferRelease(x_buf);
-    status = CLBlastBufferRelease(w_buf);
-    status = CLBlastBufferRelease(xout_buf);
+    // W (d,n) @ x (n,) -> xout (d,)
+    // by far the most amount of time is spent inside this little function
+    int i;
+    #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < n; j++) {
+            val += w[i * n + j] * x[j];
+        }
+        xout[i] = val;
+    }
 }
 
 float* forward(Transformer* transformer, int token, int pos) {
